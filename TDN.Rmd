@@ -1,0 +1,405 @@
+### Fitting  the model with full features analysed;
+* DPP4 is the treatment, and hba1c is still kept as the outcome
+* ncurrtx and drugline are treated as categorical variables.
+* Orthongonalization implelemented
+* Missingness allowed.
+
+```{r}
+# removing all the variables from the environment when re-running the analysis.
+rm(list = ls(all.names = T))
+# Setting seed to ensure same result are reproduced each time.
+set.seed(1)
+```
+### loading the dataset into the workingt global environment.
+```{r}
+load("/slade/CPRD_data/mastermind_2019/Samuel/cprd_19_HDSproject_cohort.Rdata")
+```
+### loading the required library for the data analysis and manipulations.
+```{r echo=FALSE, results='hide'}
+library (grf, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/grf')
+library (tidyverse, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library (mice, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library (sufrep, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library (caret, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library(DiagrammeR, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+```
+### Peeking thge head of the data
+```{r}
+head(data)
+```
+```{r}
+feature.filter <- c("datedrug", "drugstopdate", "MFN", "SU", 
+                    "Acarbose", "GLP1", "Glinide", "DPP4", "INS", "SGLT2", "TZD",
+                    "bestdiagdate", "ethcode", "posthba1c6mmmol", "posthba1c12mmmol",
+                    "eth5", "eth16", "yrdrugstart", "ethnicitylong", "drugcombo")
+```
+```{r}
+data %>% select(fldrug) %>% unique()
+```
+```{r}
+stop_drug <- data %>% select(contains("stopdrug")) %>%
+  names()
+stop_drug
+```
+
+```{r}
+all_col <- c(names(data))
+longfeatlist <- all_col[which(!all_col %in% feature.filter)]
+longfeatlist <- longfeatlist[which(!longfeatlist %in% stop_drug)]
+longfeatlist <- c(longfeatlist, "stopdrug12m_3mFU")
+longfeatlist
+```
+```{r}
+sapply(data[, longfeatlist], class)
+```
+#### picking the char column band factor columns from the above feature list.
+```{r}
+required_cat_col <- c(
+  "malesex",
+  "Category", # character
+  "fldrug",
+  "drugcombo",
+  "drugclass",
+  "drugline",
+  "ncurrtx"
+)
+```
+
+```{r}
+numeric_col <- longfeatlist[!longfeatlist %in% required_cat_col]
+numeric_col
+```
+
+#### Extracting the drug cohorts separately and combining them with a balanced number of rows to check if it will impact the average treatment effetcs values
+```{r}
+# # Extracting cohorts on DPP4
+DPP4.cohorts <- data %>%
+  select("pateddrug":"fladherence_t") %>%
+  group_by(pateddrug, drugclass) %>%
+  filter(drugclass == "DPP4")
+ # Extracting cohort on SGLT2
+SGLT2.cohorts <- data %>%
+  select("pateddrug":"fladherence_t") %>%
+  group_by(pateddrug, drugclass) %>%
+  filter(drugclass == "SGLT2")
+
+# Balancing the sample, by selecting equal rows from DPP4 to match the sample amount in SGLT2
+sglt2.dpp4 <- rbind(SGLT2.cohorts, DPP4.cohorts)
+
+```
+```{r}
+nrow(sglt2.dpp4) 
+# 16425
+nrow(SGLT2.cohorts)
+# 16424
+nrow(DPP4.cohorts)
+# 50608
+#nrow(DPP4.cohorts[0:nrow(SGLT2.cohorts), ])
+```
+
+```{r}
+sglt2.dpp4 <- sglt2.dpp4[, which(names(sglt2.dpp4) %in% longfeatlist)]
+sglt2.dpp4 <- sglt2.dpp4 %>% rename("stopdrug" = "stopdrug12m_3mFU")
+sglt2.dpp4 <- within(sglt2.dpp4, drugclass <- factor(drugclass))
+sglt2.dpp4$Category <- as.factor(sglt2.dpp4$Category)
+sglt2.dpp4$malesex <- as.integer(sglt2.dpp4$malesex)
+sglt2.dpp4 <- within(sglt2.dpp4, deltaHba1c <- posthba1c_final - prehba1cmmol)
+sglt2.dpp4 <- sglt2.dpp4[which(complete.cases(sglt2.dpp4$stopdrug)), ]
+sglt2.dpp4$W <- if_else(sglt2.dpp4$drugclass == "DPP4", 1, 0)
+sglt2.dpp4 <- sglt2.dpp4[sample(1:nrow(sglt2.dpp4)), ]
+
+sglt2.dpp4 %>%
+  head()
+```
+### Splitting the samples into train and test sample for evaluation later
+```{r}
+dftd_train <- sglt2.dpp4 %>% group_by(drugclass) %>%
+  sample_frac(.6)
+dftd_train <- data.frame(dftd_train)
+#dftd_test <- sglt2.dpp4[!(sglt2.dpp4$pateddrug %in% dftd_train$pateddrug), ]
+dftd_test <- subset(sglt2.dpp4, !(pateddrug %in% dftd_train$pateddrug))
+dftd_train$pateddrug <- NULL ; dftd_test$pateddrug <- NULL
+prop.table(table(dftd_train$drugclass))
+prop.table(table(dftd_test$drugclass))
+```
+
+### Preprocessing for the training set.
+```{r}
+# setting a global option for  na
+options(na.action = "na.pass")
+# setting Y, and W
+Y <- dftd_train$stopdrug
+W <- dftd_train$W
+
+
+
+X_train <- data.frame(dftd_train) %>% 
+  select(-W, -stopdrug, -deltaHba1c, -drugclass, -posthba1c_final) 
+
+dlx <- model.matrix(~ 0 + ., data = X_train["drugline"])
+ncx <- model.matrix(~ 0 + ., data = X_train["ncurrtx"])
+cax <- model.matrix(~ 0 + ., data = X_train["Category"])
+fldx <- model.matrix(~ 0 + ., data = X_train["fldrug"])
+
+# binding the data set
+X_train <- cbind(X_train[, -which(names(X_train) %in% c("drugline", "ncurrtx", "Category", "fldrug"))], dlx, ncx, cax, fldx)
+X_train <- X_train %>%model.matrix(~ ., data = .)
+
+X_train <- X_train[, -1]
+
+#head(X_train)
+any(is.na(X_train))
+```
+
+```{r}
+W.forest <- regression_forest(X = X_train, Y = W,
+                              num.trees = 5000,
+                              ci.group.size = 2,
+                              min.node.size = 10,
+                              alpha = 0.05,
+                              imbalance.penalty = 0.05,
+                              honesty = TRUE,
+                              tune.parameters = "all")
+
+W.hat <- predict(W.forest)$predictions
+
+```
+```{r}
+df_Y <- data.frame(dftd_train) %>%
+  select(-W, -stopdrug, -posthba1c_final, -drugclass, -ncurrtx, -drugline, -fldrug, -flt2dmduration) %>%
+  model.matrix(~ ., data = .)
+
+any(is.na(df_Y))
+# Removing the intercept
+df_Y <- df_Y[, -1]
+head(df_Y)
+Y.forest <- regression_forest(X = df_Y, Y = Y,
+                              num.trees = 5000,
+                              ci.group.size = 2,
+                              min.node.size = 10,
+                              alpha = 0.05,
+                              imbalance.penalty = 0.05,
+                              honesty = TRUE,
+                              tune.parameters = "all")
+
+Y.hat <- predict(Y.forest)$predictions
+```
+```{r}
+hist(W.hat, col = "pink")
+
+```
+```{r}
+hist(Y.hat, col = "green")
+```
+fitting the model first setup
+```{r}
+cf1 <- causal_forest(X = df_Y, Y = Y,
+                    W = W,
+                    Y.hat = Y.hat,
+                    W.hat = W.hat,
+                    num.trees = 5000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    honesty = TRUE,
+                    tune.parameters = "all")
+
+```
+fitting the model second setup
+```{r}
+cf2 <- causal_forest(X = df_Y, Y = Y,
+                    W = W,
+                    Y.hat = Y.hat,
+                    W.hat = W.hat,
+                    num.trees = 7000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    honesty = TRUE,
+                    tune.parameters = "all")
+
+```
+fitting the model third setup
+```{r}
+cf3 <- causal_forest(X = df_Y, Y = Y,
+                    W = W,
+                    Y.hat = Y.hat,
+                    W.hat = W.hat,
+                    num.trees = 5000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    sample.fraction = 0.5,
+                    honesty = TRUE,
+                    honesty.fraction = 0.5,
+                    honesty.prune.leaves = TRUE,
+                    mtry = ncol(df_Y),
+                    tune.parameters = c("min.node.size", "honesty.prune.leaves"))
+
+```
+fitting the model fourth setup
+```{r}
+cf4 <- causal_forest(X = df_Y, Y = Y,
+                    W = W,
+                    Y.hat = Y.hat,
+                    W.hat = W.hat,
+                    num.trees = 7000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    sample.fraction = 0.5,
+                    honesty = TRUE,
+                    honesty.fraction = 0.5,
+                    mtry = ncol(df_Y),
+                    tune.parameters = c("min.node.size", "honesty.prune.leaves"))
+
+```
+
+### Preprocessing for the test set
+```{r}
+# factor = drug class, drug line, ncurrtx
+
+Y.test <- dftd_test$stopdrug
+W.test <- dftd_test$W
+
+X_test <- data.frame(dftd_test) %>% 
+  select(-W, -stopdrug, -deltaHba1c, -posthba1c_final, -drugclass)
+
+dltx <- model.matrix(~ 0 + ., data = X_test["drugline"])
+nctx <- model.matrix(~ 0 + ., data = X_test["ncurrtx"])
+#dctx <- model.matrix(~ 0 + ., data = X_test["drugcombo"])
+catx <- model.matrix(~ 0 + ., data = X_test["Category"])
+fldtx <- model.matrix(~ 0 + ., data = X_test["fldrug"])
+
+X_test <- cbind(X_test[, -which(names(X_test) %in% c("drugline", "ncurrtx", "drugcombo", "Category", "fldrug"))], dltx, nctx, catx, fldtx)
+
+X_test <- X_test %>% model.matrix(~ ., data = .)
+
+any(is.na(X_test))
+X_test <- X_test[, -1]
+#head(X_test)
+
+```
+
+### Fitting the Evaluation Forest.
+```{r}
+W.test.hat <- regression_forest(X = X_test, Y = W.test,
+                                num.trees = 2000,
+                                ci.group.size = 2,
+                                min.node.size = 10,
+                                honesty = TRUE,
+                                tune.parameters = "all")
+W.T.hat <- predict(W.test.hat)$predictions
+## Replicating for Y. test
+df_Yt <- data.frame(dftd_test) %>%
+  select(-W, -stopdrug, -posthba1c_final, -drugline, -ncurrtx, -drugclass, -fldrug, -flt2dmduration) %>%
+  model.matrix(~ ., data = .)
+df_Yt <- df_Yt[, -1]
+## Fitting the y.test model
+Y.test.hat <- regression_forest(X = df_Yt, Y = Y.test,
+                                num.trees = 2000,
+                                ci.group.size = 2,
+                                min.node.size = 10,
+                                honesty = TRUE,
+                                tune.parameters = "all")
+
+Y.T.hat <- predict(Y.test.hat)$predictions
+
+eval.forest <- causal_forest(X = df_Yt, Y = Y.test,
+                             W = W.test,
+                             W.hat = W.T.hat,
+                             Y.hat = Y.T.hat,
+                             num.trees = 2000,
+                             alpha = 0.05,
+                             imbalance.penalty = 0.05,
+                             ci.group.size = 2,
+                             honesty = TRUE,
+                             tune.parameters = "all")
+```
+## Checking the forest calibrations for both the trained forest and the test forest
+```{r}
+test_calibration(eval.forest, vcov.type = "HC0")
+```
+```{r}
+test_calibration(cf1,vcov.type = "HC0")
+```
+```{r}
+test_calibration(cf2,vcov.type = "HC0")
+```
+```{r}
+test_calibration(cf3,vcov.type = "HC0")
+```
+```{r}
+test_calibration(cf4,vcov.type = "HC0")
+```
+```{r}
+average_treatment_effect(cf4, target.sample = "overlap")
+```
+
+```{r}
+tau.hat <- predict(cf4, df_Yt)$predictions
+```
+```{r}
+TOC <- rank_average_treatment_effect(eval.forest, tau.hat, target = "AUTOC")
+plot(TOC, col = "red");
+```
+### Getting a point estimate using the trained forest
+```{r}
+cf_pred <- predict(cf4, df_Yt, estimate.variance = TRUE)
+```
+```{r}
+hist(cf_pred$predictions, main="Causal forests: Point estimate of CATE",
+     xlab = "predict oob cate", ylab = "number of patients")
+abline(v=mean(cf_pred$predictions), col = "green", lty = "dashed", lwd=3)
+abline(v=0, col = "red", lty = "dashed", lwd = 3)
+```
+### Estimating the average treatment effect
+```{r}
+ate.hat <- average_treatment_effect(cf4, target.sample = "control")
+print(paste("95% CI for ATE:", round(ate.hat["estimate"], 3), "+/-", round(1.96*ate.hat["std.err"], 3)))
+```
+```{r}
+ate.hat <- average_treatment_effect(cf4, target.sample = "treated")
+print(paste("95% CI for ATE:", round(ate.hat["estimate"], 3), "+/-", round(1.96*ate.hat["std.err"], 3)))
+```
+```{r}
+ate.hat <- average_treatment_effect(cf4, target.sample = "overlap")
+print(paste("95% CI for ATE:", round(ate.hat["estimate"], 3), "+/-", round(1.96*ate.hat["std.err"], 3)))
+```
+
+```{r}
+oob_predictions <- predict(cf4, estimate.variance = TRUE)
+Z.scores <- oob_predictions$predictions / oob_predictions$variance.estimates
+```
+### Visualizing the Z scores
+The Z.score measures significance of the heterogeneous treatment effect estimates. Under the null, we might expect the Z-scores to be roughly standard Gaussian.
+```{r}
+hist(Z.scores)
+```
+### Anothervisualization
+```{r}
+plot(oob_predictions$predictions, sqrt(oob_predictions$variance.estimates))
+abline(0, 1/1.96); abline(0, -1/1.96)
+```
+It looks like the Z-scores have a noted left skew. It clear that we have some individuals for whom tau is negative, and also have evidence that there are some people for whom tau is positive.
+### plotting first prediction on the second predictions
+```{r}
+# plot(oob2_predictions$predictions, oob_predictions$predictions); abline(0,1)
+# summary(lm(oob_predictions$predictions ~ oob2_predictions$predictions))
+```
+
+```{r}
+oob_cf <- oob_predictions$predictions
+varimp <- variable_importance(cf4, decay.exponent = 2, max.depth = 4)
+selected.idx <- which(varimp > 0.05)
+```
+```{r}
+names(varimp) <- colnames(cf4$X.orig)
+sorted_varimp <- sort(varimp, decreasing = T)
+varim_abovemean <- sorted_varimp[selected.idx]
+t(varim_abovemean)
+```
+```{r}
+barplot(varim_abovemean, las = 2, col = "red", main = "Variable importance plot")
+```
+
+
+
+
+

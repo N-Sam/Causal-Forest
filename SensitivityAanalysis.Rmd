@@ -1,0 +1,364 @@
+### Fitting the model with Orthongonalisation, and trying new alteranative hyperparmeters;
+* DPP4 is the treatment, and hba1c is still kept as the outcome
+* ncurrtx and drugline are treated as categorical variables.
+* Ordering of the columns has been kept as required and it has proven to matter in the plot of the individual variable interaction with the target variable.
+* Missingness allowed.
+
+```{r}
+# removing all the variables from the environment when re-running the analysis.
+rm(list = ls(all.names = T))
+# Setting seed to ensure same result are reproduced each time.
+set.seed(12)
+```
+### loading the dataset into the workingt global environment.
+```{r}
+load("/slade/CPRD_data/mastermind_2019/Samuel/cprd_19_HDSproject_cohort.Rdata")
+```
+### loading the required library for the data analysis and manipulations.
+```{r echo = T, results = 'hide'}
+library (grf, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/grf')
+library (tidyverse, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library (mice, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library (sufrep, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library (caret, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+library(DiagrammeR, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+#library(policytree, lib.loc = '/slade/home/ns650/R/x86_64-pc-linux-gnu-library/4.0/')
+```
+
+```{r}
+covariates_list <- c("pateddrug", "drugclass", "prebmi", "prealt", "agetx", "egfr_ckdepi", "prehba1cmmol", "ncurrtx", "drugline", "posthba1c_final")
+
+```
+
+#### Extracting the durg cohorts separately and combining them with a balanced number of rows to check if it will impact the average treatment effetcs values
+```{r}
+# # Extracting cohorts on DPP4
+DPP4.cohorts <- data %>%
+  select("pateddrug":"fladherence_t") %>%
+  group_by(pateddrug, drugclass) %>%
+  filter(drugclass == "DPP4")
+ # Extracting cohort on SGLT2
+SGLT2.cohorts <- data %>%
+  select("pateddrug":"fladherence_t") %>%
+  group_by(pateddrug, drugclass) %>%
+  filter(drugclass == "SGLT2")
+
+# Balancing the sample, by selecting equal rows from DPP4 to match the sample amount in SGLT2
+sglt2.dpp4 <- rbind(SGLT2.cohorts, DPP4.cohorts)
+
+```
+```{r}
+nrow(sglt2.dpp4) 
+# 16425
+nrow(SGLT2.cohorts)
+# 16424
+nrow(DPP4.cohorts)
+# 50608
+```
+
+```{r}
+df.ccase <- sglt2.dpp4[, which(names(sglt2.dpp4) %in% covariates_list)]
+df.ccase <- within(df.ccase, drugclass <- factor(drugclass))
+df.ccase <- within(df.ccase, deltaHba1c <- posthba1c_final - prehba1cmmol)
+df.ccase <- df.ccase[which(complete.cases(df.ccase$deltaHba1c)), ]
+df.ccase$W <- if_else(df.ccase$drugclass == "SGLT2", 1, 0)
+
+df.ccase %>%
+  head()
+```
+### Splitting the complete cases samples into train and test sample for evaluation later
+```{r}
+train.cc <- df.ccase %>% group_by(drugclass) %>% sample_frac(.6)
+train.cc <- data.frame(train.cc)
+test.cc <- subset(df.ccase, !(pateddrug %in% train.cc$pateddrug))
+prop.table(table(train.cc$drugclass))
+prop.table(table(test.cc$drugclass))
+train.cc$pateddrug <- NULL;test.cc$pateddrug <- NULL
+```
+### Preprocessing for the training set.
+```{r}
+options(na.action = "na.pass")
+Y.cc <- train.cc$deltaHba1c
+W.cc <- train.cc$W
+
+
+
+X.train.cc <- data.frame(train.cc) %>% 
+  select(-W, -deltaHba1c, -drugclass, -posthba1c_final) 
+
+dlxc <- model.matrix(~ 0 + ., data = X.train.cc["drugline"])
+ncxc <- model.matrix(~ 0 + ., data = X.train.cc["ncurrtx"])
+
+X.train.cc <- cbind(X.train.cc[, -which(names(X.train.cc) %in% c("drugline", "ncurrtx"))], dlxc, ncxc)
+X.train.cc <- X.train.cc %>%model.matrix(~ ., data = .)
+
+X.train.cc <- X.train.cc[, -1]
+any(is.na(X.train.cc))
+head(X.train.cc)
+```
+
+```{r}
+W.forest.cc <- regression_forest(X = X.train.cc, Y = W.cc,
+                              num.trees = 5000,
+                              ci.group.size = 2,
+                              min.node.size = 10,
+                              alpha = 0.05,
+                              imbalance.penalty = 0.05,
+                              honesty = TRUE,
+                              tune.parameters = "all")
+
+W.hat.cc <- predict(W.forest.cc)$predictions
+
+```
+```{r}
+df.Y.cc <- data.frame(train.cc) %>%
+  select(-W, -posthba1c_final,-deltaHba1c, -drugline, -ncurrtx, -drugclass) %>%
+  model.matrix(~ ., data = .)
+
+any(is.na(df.Y.cc))
+# Removing the intercept
+df.Y.cc <- df.Y.cc[, -1]
+head(df.Y.cc)
+Y.forest.cc <- regression_forest(X = df.Y.cc, Y = Y.cc,
+                              num.trees = 5000,
+                              ci.group.size = 2,
+                              min.node.size = 10,
+                              alpha = 0.05,
+                              imbalance.penalty = 0.05,
+                              honesty = TRUE,
+                              tune.parameters = "all")
+
+Y.hat.cc <- predict(Y.forest.cc)$predictions
+```
+```{r}
+hist(W.hat.cc, col = "pink")
+
+```
+```{r}
+hist(Y.hat.cc, col = "green")
+abline(v=0, lty="dashed", col = "red", lwd = 3)
+```
+#### CAUSAL FORESTS HERE
+### Complete case causal forest one
+```{r}
+cf.cc1 <- causal_forest(X = df.Y.cc, Y = Y.cc,
+                    W = W.cc,
+                    Y.hat = Y.hat.cc,
+                    W.hat = W.hat.cc,
+                    num.trees = 5000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    honesty = TRUE,
+                    tune.parameters = "all")
+```
+### Complete case causal forest two
+```{r}
+cf.cc2 <- causal_forest(X = df.Y.cc, Y = Y.cc,
+                    W = W.cc,
+                    Y.hat = Y.hat.cc,
+                    W.hat = W.hat.cc,
+                    num.trees = 7000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    honesty = TRUE,
+                    tune.parameters = "all")
+```
+### Complete case causal forest three
+```{r}
+cf.cc3 <- causal_forest(X = df.Y.cc, Y = Y.cc,
+                    W = W.cc,
+                    Y.hat = Y.hat.cc,
+                    W.hat = W.hat.cc,
+                    num.trees = 5000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    sample.fraction = 0.5,
+                    honesty = TRUE,
+                    honesty.fraction = 0.5,
+                    mtry = ncol(df.Y.cc),
+                    tune.parameters = c("min.node.size", "honesty.prune.leaves"))
+```
+### Complete case causal forest four
+```{r}
+cf.cc4 <- causal_forest(X = df.Y.cc, Y = Y.cc,
+                    W = W.cc,
+                    Y.hat = Y.hat.cc,
+                    W.hat = W.hat.cc,
+                    num.trees = 7000,
+                    min.node.size = 10,
+                    ci.group.size = 2,
+                    sample.fraction = 0.5,
+                    honesty = TRUE,
+                    honesty.fraction = 0.5,
+                    mtry = ncol(df.Y.cc),
+                    tune.parameters = c("min.node.size", "honesty.prune.leaves"))
+```
+### Preprocessing for the test set
+```{r}
+# factor = drug class, drug line, ncurrtx
+
+Y.test.cc <- test.cc$deltaHba1c
+W.test.cc <- test.cc$W
+
+X.test.cc <- data.frame(test.cc) %>% 
+  select(-W, -deltaHba1c, -posthba1c_final, -drugclass)
+
+dlxt <- model.matrix(~ 0 + ., data = X.test.cc["drugline"])
+ncxt <- model.matrix(~ 0 + ., data = X.test.cc["ncurrtx"])
+
+X.test.cc <- cbind(X.test.cc[, -which(names(X.test.cc) %in% c("drugline", "ncurrtx"))], dlxt, ncxt)
+
+X.test.cc <- X.test.cc %>% model.matrix(~ ., data = .)
+
+any(is.na(X.test.cc))
+X.test.cc <- X.test.cc[, -1]
+head(X.test.cc)
+
+```
+
+### Fitting the Evaluation Forest.
+```{r}
+Wt.forest.cc <- regression_forest(X = X.test.cc, Y = W.test.cc,
+                                num.trees = 2000,
+                                ci.group.size = 2,
+                                min.node.size = 10,
+                                alpha = 0.05,
+                                imbalance.penalty = 0.05,
+                                honesty = TRUE,
+                                tune.parameters = "all")
+W.T.hat.cc <- predict(Wt.forest.cc)$predictions
+
+## Prprocessing for the Outcome model.
+dft.Y.cc <- data.frame(test.cc) %>%
+  select(-W, -posthba1c_final,-deltaHba1c, -drugline, -ncurrtx, -drugclass) %>%
+  model.matrix(~ ., data = .)
+dft.Y.cc <- dft.Y.cc[,-1]
+
+Yt.forest.cc <- regression_forest(X = dft.Y.cc, Y = Y.test.cc,
+                                num.trees = 2000,
+                                ci.group.size = 2,
+                                min.node.size = 10,
+                                alpha = 0.05,
+                                imbalance.penalty = 0.05,
+                                honesty = TRUE,
+                                tune.parameters = "all")
+Y.T.hat.cc <- predict(Y.forest.cc)$predictions
+
+eval.forest.cc <- causal_forest(X = dft.Y.cc, Y = Y.test.cc,
+                             W = W.test.cc,
+                             W.hat = W.T.hat.cc,
+                             num.trees = 2000,
+                             alpha = 0.05,
+                             imbalance.penalty = 0.05,
+                             ci.group.size = 2,
+                             honesty = TRUE,
+                             tune.parameters = "all")
+```
+```{r}
+test_calibration(eval.forest.cc)
+```
+### Checking the models calibrations
+```{r}
+test_calibration(cf.cc1)
+```
+```{r}
+tau.cc1 <- predict(cf.cc1, dft.Y.cc)$predictions
+rank_average_treatment_effect(eval.forest.cc, tau.cc1, target = "AUTOC")
+```
+```{r}
+test_calibration(cf.cc2)
+```
+```{r}
+tau.cc2 <- predict(cf.cc2, dft.Y.cc)$predictions
+rank_average_treatment_effect(eval.forest.cc, tau.cc2, target = "AUTOC")
+```
+```{r}
+test_calibration(cf.cc3)
+```
+```{r}
+tau.cc3 <- predict(cf.cc3, dft.Y.cc)$predictions
+rank_average_treatment_effect(eval.forest.cc, tau.cc3, target = "AUTOC")
+```
+```{r}
+test_calibration(cf.cc4)
+```
+```{r}
+tau.cc4 <- predict(cf.cc4, dft.Y.cc)$predictions
+rtc <- rank_average_treatment_effect(eval.forest.cc, tau.cc4, target = "AUTOC")
+rtc
+```
+```{r}
+plot(rtc, col = "red", main = "TOC of best extended model")
+```
+
+#### Extracting variable importance.
+```{r}
+varimp <- variable_importance(cf.cc4, decay.exponent = 2, max.depth = 4)
+# selected.idx <- which(varimp > mean(abs(varimp)))
+# selected.idx <- which(varimp > 0.005)
+varimp <- t(varimp)
+colnames(varimp) <- colnames(cf.cc4$X.orig)
+varimp
+```
+
+```{r}
+barplot(varimp, cex.names = .7, las = 2, col = "red", main = "Variable importance plot for best extend model")
+```
+### Visualizing ITE
+### Helper functions
+```{r}
+plot_cate_sna <- function(tau.hat=tau.hat, model=""){
+  
+  favoured <- tau.hat[which(tau.hat > 0)]
+  unfavoured <- tau.hat[which(tau.hat < 0)]
+  hist(favoured, col = "cornflowerblue",
+       xlab = "CATE predicted",
+       ylab = "Number of people",
+       xlim = c(-15, 5),
+       main = paste("Predicted CATE from", model)
+  )
+  hist(unfavoured, col = "yellow", add = TRUE)
+  labels <- c("Favours SGLT2", "Favours DPP4")
+  legend("topleft", legend = labels,
+         cex = 0.8,
+         inset = 0.01,
+         pch = 15,
+         col = c("cornflowerblue","yellow")
+  )
+  abline(v=mean(tau.hat), col = "green", lty = "dashed", lwd=3)
+  abline(v=0, col = "red", lty = "dashed", lwd = 3)
+}
+### function for plotting rank average treatment effects
+plotrank_avgte <- function(eval.forest=eval.forest, tau.hat=tau.hat, model=""){
+  TOC <- rank_average_treatment_effect(eval.forest, tau.hat, target = "AUTOC")
+  plot(TOC, main = paste("TOC from", model), col = "red");
+}
+plot_varimp <- function(varimp=varimp, model=""){
+  barplot(varimp, cex.names = .7, las = 2, col = "red",
+          main = paste("Variable importance plot from", model))
+}
+```
+```{r}
+plot_cate_sna(tau.cc4, "Complete model")
+# favoured <- tau.cc4[which(tau.cc4 >0)]
+# unfavoured <- tau.cc4[which(tau.cc4 < 0)]
+# hist(unfavoured, col = "cornflowerblue",
+#      xlim = c(-12, 3),
+#      ylim = c(0, 5000))
+# hist(favoured, col = "yellow",
+#      add = TRUE)
+# lab <- c("Favours SGlT2", "Favours DPP4")
+# legend("topright", legend = lab,
+#        cex = 0.8,
+#        inset = 0.01,
+#        pch = 15,
+#        col = c("cornflowerblue", "yellow"))
+# abline(v=0, col="red", lty = "dashed", lwd=2)
+# abline(h=300, col="black", lty = "dashed", lwd=2)
+```
+```{r}
+plot_varimp(varimp, "extended model")
+```
+```{r}
+plotrank_avgte(eval.forest.cc, tau.cc4, "extende model")
+```
